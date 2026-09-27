@@ -6,6 +6,8 @@ import com.github.h3yow.loanservicingenginejava.domain.LoanTerms;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentCommand;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentOutcome;
 import com.github.h3yow.loanservicingenginejava.domain.RepaymentMethod;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalCommand;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalOutcome;
 import com.github.h3yow.loanservicingenginejava.domain.RiskState;
 import com.github.h3yow.loanservicingenginejava.domain.RiskTransitionRecord;
 import com.github.h3yow.loanservicingenginejava.service.LoanServicingService;
@@ -41,6 +43,10 @@ public class LoanController {
     public record PaymentRequest(String idempotencyKey, BigDecimal amount, LocalDate effectiveDate) {
     }
 
+    public record ReversalRequest(Long paymentSequence, String idempotencyKey, BigDecimal amount,
+                                  LocalDate effectiveDate, String reason) {
+    }
+
     public record RiskTransitionRequest(RiskState target, LocalDate effectiveDate, String reason) {
     }
 
@@ -57,6 +63,15 @@ public class LoanController {
                               @RequestBody PaymentRequest req) {
         return service.postPayment(
                 new PaymentCommand(accountId, req.idempotencyKey(), req.amount(), req.effectiveDate()),
+                LocalDateTime.now());
+    }
+
+    @PostMapping("/accounts/{accountId}/reversals")
+    public ReversalOutcome reverse(@PathVariable String accountId,
+                                   @RequestBody ReversalRequest req) {
+        return service.postReversal(
+                new ReversalCommand(accountId, req.idempotencyKey(), req.paymentSequence(),
+                        req.amount(), req.effectiveDate(), req.reason()),
                 LocalDateTime.now());
     }
 

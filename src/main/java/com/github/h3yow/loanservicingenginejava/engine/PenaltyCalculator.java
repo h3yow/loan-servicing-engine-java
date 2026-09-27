@@ -5,6 +5,7 @@ import com.github.h3yow.loanservicingenginejava.domain.AllocationLine;
 import com.github.h3yow.loanservicingenginejava.domain.DayCountConvention;
 import com.github.h3yow.loanservicingenginejava.domain.Installment;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentRecord;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalRecord;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -89,20 +90,64 @@ public class PenaltyCalculator {
                                    DayCountConvention convention,
                                    int graceDays,
                                    PaymentAllocator allocator) {
+        return replay(schedule, payments, java.util.List.of(), asOf,
+                annualPenaltyRate, convention, graceDays, allocator);
+    }
+
+    /**
+     * 重放全部还款（含冲正）：截至 asOf（含当日）已生效的冲正从其目标还款的
+     * 有效金额中扣减，随后按生效日（同日按序号）逐笔刷新罚息并重新分摊。
+     *
+     * <p>冲正口径：冲正不删除原还款事实，而是把被冲金额视作"从未收到"——
+     * 目标还款按扣减后的有效金额参与重放（整笔冲正则跳过）。
+     * 故冲正生效日之前的历史重放（asOf 更早）不受影响；
+     * 冲正生效日及之后的分摊、罚息、逾期按剩余有效流水整体重述重算。</p>
+     */
+    public List<BigDecimal> replay(List<Installment> schedule,
+                                   List<PaymentRecord> payments,
+                                   List<ReversalRecord> reversals,
+                                   LocalDate asOf,
+                                   BigDecimal annualPenaltyRate,
+                                   DayCountConvention convention,
+                                   int graceDays,
+                                   PaymentAllocator allocator) {
         resetPaid(schedule);
         List<PaymentRecord> ordered = payments.stream()
                 .sorted(Comparator.comparing((PaymentRecord p) -> p.effectiveDate)
                         .thenComparingLong(p -> p.sequence))
                 .toList();
+        java.util.Map<Long, BigDecimal> reversedByPayment = reversedByPaymentAsOf(reversals, asOf);
         for (PaymentRecord payment : ordered) {
+            BigDecimal effectiveAmount = payment.amount
+                    .subtract(reversedByPayment.getOrDefault(payment.sequence, BigDecimal.ZERO));
+            // 整笔冲正：该笔还款视作从未存在，不分摊、不产生本金减基数事件
+            payment.lines = java.util.List.of();
+            if (effectiveAmount.signum() <= 0) {
+                continue;
+            }
             // 刷新截至本笔生效日（含当日，且不包含本笔自身）的罚息
             refreshPenalty(schedule, ordered, payment.effectiveDate, payment.sequence,
                     annualPenaltyRate, convention, graceDays, true);
-            // allocate 既冲抵 paid* 又产出明细；回写流水（补录/回溯后历史分摊随之重算）。
-            payment.lines = allocator.allocate(schedule, payment.amount, payment.effectiveDate);
+            // allocate 既冲抵 paid* 又产出明细；回写流水（补录/回溯/冲正后历史分摊随之重算）。
+            payment.lines = allocator.allocate(schedule, effectiveAmount, payment.effectiveDate);
         }
         return refreshPenalty(schedule, ordered, asOf, Long.MAX_VALUE,
                 annualPenaltyRate, convention, graceDays, false);
+    }
+
+    /**
+     * 汇总截至 asOf（含当日）每笔目标还款被冲正的金额合计。
+     */
+    private java.util.Map<Long, BigDecimal> reversedByPaymentAsOf(List<ReversalRecord> reversals,
+                                                                  LocalDate asOf) {
+        java.util.Map<Long, BigDecimal> result = new java.util.HashMap<>();
+        for (ReversalRecord reversal : reversals) {
+            if (reversal.effectiveDate.isAfter(asOf)) {
+                continue;
+            }
+            result.merge(reversal.targetPaymentSequence, reversal.amount, BigDecimal::add);
+        }
+        return result;
     }
 
     /**

@@ -1,8 +1,10 @@
 package com.github.h3yow.loanservicingenginejava.store;
 
+import com.github.h3yow.loanservicingenginejava.domain.IdempotencyKind;
 import com.github.h3yow.loanservicingenginejava.domain.IdempotencyRecord;
 import com.github.h3yow.loanservicingenginejava.domain.LoanAccount;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentRecord;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RiskTransitionRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RejectReason;
 import com.github.h3yow.loanservicingenginejava.service.ServicingException;
@@ -28,6 +30,7 @@ public class LoanAccountRepository {
 
     private final Map<String, LoanAccount> accounts = new ConcurrentHashMap<>();
     private final Map<String, List<PaymentRecord>> payments = new ConcurrentHashMap<>();
+    private final Map<String, List<ReversalRecord>> reversals = new ConcurrentHashMap<>();
     private final Map<String, List<RiskTransitionRecord>> riskHistory = new ConcurrentHashMap<>();
     private final Map<String, IdempotencyRecord> idempotency = new ConcurrentHashMap<>();
     private final Map<String, Object> accountLocks = new ConcurrentHashMap<>();
@@ -37,6 +40,7 @@ public class LoanAccountRepository {
     public void saveAccount(LoanAccount account) {
         accounts.put(account.accountId, account);
         payments.putIfAbsent(account.accountId, new ArrayList<>());
+        reversals.putIfAbsent(account.accountId, new ArrayList<>());
         riskHistory.putIfAbsent(account.accountId, new ArrayList<>());
     }
 
@@ -55,6 +59,28 @@ public class LoanAccountRepository {
 
     public List<PaymentRecord> paymentsOf(String accountId) {
         return payments.getOrDefault(accountId, List.of());
+    }
+
+    /**
+     * 按序号查找还款流水（须在账户锁内调用）。
+     */
+    public PaymentRecord paymentBySequence(String accountId, long sequence) {
+        return payments.getOrDefault(accountId, List.of()).stream()
+                .filter(p -> p.sequence == sequence)
+                .findFirst().orElse(null);
+    }
+
+    public List<ReversalRecord> reversalsOf(String accountId) {
+        return reversals.getOrDefault(accountId, List.of());
+    }
+
+    /**
+     * 按幂等键查找冲正流水（须在账户锁内调用）。
+     */
+    public ReversalRecord reversalByKey(String accountId, String key) {
+        return reversals.getOrDefault(accountId, List.of()).stream()
+                .filter(r -> r.idempotencyKey.equals(key))
+                .findFirst().orElse(null);
     }
 
     public List<RiskTransitionRecord> riskHistoryOf(String accountId) {
@@ -92,6 +118,13 @@ public class LoanAccountRepository {
     }
 
     /**
+     * 追加冲正流水（须在账户锁内调用）。
+     */
+    public void addReversal(String accountId, ReversalRecord record) {
+        reversals.get(accountId).add(record);
+    }
+
+    /**
      * 追加风险流转记录（须在账户锁内调用）。
      */
     public void addRiskTransition(String accountId, RiskTransitionRecord record) {
@@ -103,7 +136,12 @@ public class LoanAccountRepository {
      */
     public IdempotencyRecord putIdempotency(String key, String accountId,
                                             BigDecimal amount, long seq) {
-        IdempotencyRecord record = new IdempotencyRecord(accountId, amount, seq);
+        return putIdempotency(IdempotencyKind.PAYMENT, key, accountId, amount, seq);
+    }
+
+    public IdempotencyRecord putIdempotency(IdempotencyKind kind, String key, String accountId,
+                                            BigDecimal amount, long refSequence) {
+        IdempotencyRecord record = new IdempotencyRecord(kind, accountId, amount, refSequence);
         idempotency.put(key, record);
         return record;
     }

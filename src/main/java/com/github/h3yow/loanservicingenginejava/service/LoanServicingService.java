@@ -4,6 +4,7 @@ import com.github.h3yow.loanservicingenginejava.config.ServicingProperties;
 import com.github.h3yow.loanservicingenginejava.domain.AccountStatus;
 import com.github.h3yow.loanservicingenginejava.domain.AllocationBucket;
 import com.github.h3yow.loanservicingenginejava.domain.AllocationLine;
+import com.github.h3yow.loanservicingenginejava.domain.IdempotencyKind;
 import com.github.h3yow.loanservicingenginejava.domain.IdempotencyRecord;
 import com.github.h3yow.loanservicingenginejava.domain.Installment;
 import com.github.h3yow.loanservicingenginejava.domain.LoanAccount;
@@ -12,6 +13,9 @@ import com.github.h3yow.loanservicingenginejava.domain.PaymentCommand;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentOutcome;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RejectReason;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalCommand;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalOutcome;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RiskState;
 import com.github.h3yow.loanservicingenginejava.domain.RiskTransitionRecord;
 import com.github.h3yow.loanservicingenginejava.engine.OverdueEvaluator;
@@ -100,12 +104,19 @@ public class LoanServicingService {
                 command.accountId, command.idempotencyKey, command.amount, effectiveDate, submittedAt);
 
         return repository.withAccountAndKey(command.accountId, command.idempotencyKey, account -> {
-            if (account.status != AccountStatus.ACTIVE) {
+            // 还款只允许 ACTIVE 且未核销；SETTLED/CLOSED/WRITTEN_OFF 一律拒绝
+            if (account.status != AccountStatus.ACTIVE
+                    || account.riskState == RiskState.WRITTEN_OFF) {
                 throw new ServicingException(RejectReason.ACCOUNT_NOT_POSTABLE,
-                        "账户当前状态不可入账: " + account.status);
+                        "账户当前状态不可入账: status=" + account.status
+                                + " riskState=" + account.riskState);
             }
             IdempotencyRecord existing = repository.idempotency(command.idempotencyKey).orElse(null);
             if (existing != null) {
+                if (existing.kind != IdempotencyKind.PAYMENT) {
+                    throw new ServicingException(RejectReason.IDEMPOTENCY_KEY_CONFLICT,
+                            "幂等键已被冲正占用: " + command.idempotencyKey);
+                }
                 IdempotencyView view = IdempotencyView.of(existing, command);
                 if (!view.sameRequest()) {
                     throw new ServicingException(RejectReason.IDEMPOTENCY_KEY_CONFLICT,
@@ -113,15 +124,15 @@ public class LoanServicingService {
                                     + "（账户/金额不一致）");
                 }
                 LocalDate originalDate = repository.paymentsOf(account.accountId).stream()
-                        .filter(p -> p.sequence == existing.paymentSequence)
+                        .filter(p -> p.sequence == existing.refSequence)
                         .map(p -> p.effectiveDate)
                         .findFirst().orElse(effectiveDate);
                 ReplayState state = replay(account, originalDate);
                 log.info("[还款重复] key={} 命中既有流水 seq={} 生效日={} 不重复扣款; 剩余应还={} 账户状态={}",
-                        command.idempotencyKey, existing.paymentSequence, originalDate,
+                        command.idempotencyKey, existing.refSequence, originalDate,
                         state.totalOutstanding(), account.status);
                 return new PaymentOutcome(true, command.idempotencyKey,
-                        recordLines(account.accountId, existing.paymentSequence),
+                        recordLines(account.accountId, existing.refSequence),
                         command.amount, state.totalOutstanding(), account.status);
             }
 
@@ -146,9 +157,8 @@ public class LoanServicingService {
                     .map(l -> new AllocationLine(l.installmentSeq, l.bucket, l.amount))
                     .toList();
             verifyFullyAllocated(command.amount, lines);
-            if (after.totalOutstanding().signum() == 0) {
-                account.status = AccountStatus.SETTLED;
-            }
+            account.status = after.totalOutstanding().signum() == 0
+                    ? AccountStatus.SETTLED : AccountStatus.ACTIVE;
             log.info("[还款入账] key={} seq={} 生效日={} 分摊{}条 本次分摊={} 剩余应还={} 账户状态={}",
                     command.idempotencyKey, seq, effectiveDate, lines.size(), command.amount,
                     after.totalOutstanding(), account.status);
@@ -158,6 +168,160 @@ public class LoanServicingService {
             return new PaymentOutcome(false, command.idempotencyKey, lines,
                     command.amount, after.totalOutstanding(), account.status);
         });
+    }
+
+    /**
+     * 还款冲正：对已入账还款整笔/部分冲正，随后按生效日整体重放重算。
+     *
+     * <p>语义：冲正不删除原还款，而是把被冲金额视作"从未收到"；冲正生效日及之后
+     * 的分摊、剩余应还、罚息、逾期天数与风险状态按剩余有效流水重述重算。
+     * 同一笔还款累计冲正金额不得超过原还款金额。</p>
+     *
+     * <p>幂等语义与还款一致：同键同内容重复提交返回第一次结果；同键内容不符
+     * （类型串用/目标还款或账户不一致/金额不符）拒绝为 {@code IDEMPOTENCY_KEY_CONFLICT}。
+     * 已结清账户允许冲正（可能退回未结清）；已关账/已核销等终态拒绝。</p>
+     */
+    public ReversalOutcome postReversal(ReversalCommand command, LocalDateTime submittedAt) {
+        validateReversalCommand(command, submittedAt);
+        LocalDate effectiveDate = resolveEffectiveDate(command.effectiveDate, submittedAt);
+        log.info("[冲正请求] accountId={} key={} targetSeq={} amount={} effectiveDate={} reason={} submittedAt={}",
+                command.accountId, command.idempotencyKey, command.paymentSequence,
+                command.amount, effectiveDate, command.reason, submittedAt);
+
+        return repository.withAccountAndKey(command.accountId, command.idempotencyKey, account -> {
+            // 终态账户（已关账/已核销）：所有资金类操作拒绝，不写账
+            if (!isFundOperationAllowed(account)) {
+                throw new ServicingException(RejectReason.ACCOUNT_NOT_POSTABLE,
+                        "账户当前状态不可发起冲正: status=" + account.status
+                                + " riskState=" + account.riskState);
+            }
+            IdempotencyRecord existing = repository.idempotency(command.idempotencyKey).orElse(null);
+            if (existing != null) {
+                if (existing.kind != IdempotencyKind.REVERSAL) {
+                    throw new ServicingException(RejectReason.IDEMPOTENCY_KEY_CONFLICT,
+                            "幂等键已被还款占用: " + command.idempotencyKey);
+                }
+                if (!existing.accountId.equals(command.accountId)
+                        || existing.refSequence != command.paymentSequence
+                        || existing.amount.compareTo(command.amount) != 0) {
+                    throw new ServicingException(RejectReason.IDEMPOTENCY_KEY_CONFLICT,
+                            "幂等键已被其它冲正请求占用: " + command.idempotencyKey
+                                    + "（账户/目标还款/金额不一致）");
+                }
+                ReversalRecord first = repository.reversalByKey(account.accountId,
+                        command.idempotencyKey);
+                ReplayState state = replay(account, first.effectiveDate);
+                log.info("[冲正重复] key={} 命中既有冲正 seq={} 目标seq={} 不重复冲账; 剩余应还={} 账户状态={}",
+                        command.idempotencyKey, first.sequence, first.targetPaymentSequence,
+                        state.totalOutstanding(), account.status);
+                return buildReversalOutcome(true, first, state, account, first.effectiveDate);
+            }
+
+            PaymentRecord target = repository.paymentBySequence(account.accountId,
+                    command.paymentSequence);
+            if (target == null) {
+                throw new ServicingException(RejectReason.PAYMENT_NOT_FOUND,
+                        "被冲还款不存在: seq=" + command.paymentSequence);
+            }
+            if (effectiveDate.isBefore(target.effectiveDate)) {
+                throw new ServicingException(RejectReason.REVERSAL_DATE_INVALID,
+                        "冲正生效日 " + effectiveDate + " 早于被冲还款生效日 "
+                                + target.effectiveDate);
+            }
+            BigDecimal alreadyReversed = cumulativeReversed(account.accountId,
+                    command.paymentSequence);
+            BigDecimal cumulative = alreadyReversed.add(command.amount);
+            if (cumulative.compareTo(target.amount) > 0) {
+                throw new ServicingException(RejectReason.REVERSAL_EXCEEDS_PAYMENT,
+                        "累计冲正金额 " + cumulative + " 超过原还款金额 " + target.amount
+                                + "（已冲 " + alreadyReversed + "）");
+            }
+
+            long seq = repository.nextSequence();
+            ReversalRecord record = new ReversalRecord(command.idempotencyKey,
+                    command.paymentSequence, command.amount, effectiveDate,
+                    submittedAt.toLocalDate(), seq, command.reason);
+            repository.addReversal(account.accountId, record);
+            repository.putIdempotency(IdempotencyKind.REVERSAL, command.idempotencyKey,
+                    account.accountId, command.amount, command.paymentSequence);
+
+            ReplayState after = replay(account, effectiveDate);
+            verifyConservation(account, after);
+            // 冲正暴露欠款 => 已结清退回未结清；仍为零则保持/置为 SETTLED
+            account.status = after.totalOutstanding().signum() == 0
+                    ? AccountStatus.SETTLED : AccountStatus.ACTIVE;
+            int overdueDays = overdueEvaluator.maxOverdueDays(after.schedule, effectiveDate,
+                    properties.getGraceDays(), properties.isExtendOverdueToBusinessDay());
+            applyDerivedRiskAfterFundOperation(account, effectiveDate, overdueDays,
+                    "REVERSAL(" + overdueDays + "d)");
+            log.info("[冲正入账] key={} seq={} 目标seq={} 冲正金额={} 累计冲正={}/{} 生效日={} 逾期天数={} 剩余应还={} 账户状态={} 风险={}",
+                    command.idempotencyKey, seq, command.paymentSequence, command.amount,
+                    cumulative, target.amount, effectiveDate, overdueDays,
+                    after.totalOutstanding(), account.status, account.riskState);
+            return buildReversalOutcome(false, record, after, account, effectiveDate);
+        });
+    }
+
+    /**
+     * 资金操作后按生效日规则版本重估风险：终态保持不变；分类变化且迁移合法才落历史。
+     */
+    private void applyDerivedRiskAfterFundOperation(LoanAccount account, LocalDate date,
+                                                    int overdueDays, String reasonPrefix) {
+        if (account.riskState == RiskState.WRITTEN_OFF
+                || account.riskState == RiskState.NPL) {
+            return;
+        }
+        RiskRuleVersion rule = riskRuleBook.versionAt(date)
+                .or(() -> riskRuleBook.byVersion(account.ruleVersion))
+                .orElse(null);
+        if (rule == null) {
+            return;
+        }
+        RiskState target = riskRuleBook.classify(rule, overdueDays, account);
+        RiskState from = account.riskState;
+        if (from == target) {
+            return;
+        }
+        if (!riskStateMachine.canTransition(from, target)) {
+            log.warn("[风险重估] 冲正后分类 {} 与现状 {} 的迁移不在白名单，保持现状需人工处理",
+                    target, from);
+            return;
+        }
+        RiskTransitionRecord r = new RiskTransitionRecord(date, from, target, rule.version,
+                reasonPrefix);
+        applyRiskTransition(account, r);
+        log.info("[风险重估] 关键依据: 逾期天数={} 规则版本={} => {} -> {}",
+                overdueDays, rule.version, from, target);
+    }
+
+    private ReversalOutcome buildReversalOutcome(boolean duplicate, ReversalRecord record,
+                                                 ReplayState state, LoanAccount account,
+                                                 LocalDate effectiveDate) {
+        PaymentRecord target = repository.paymentBySequence(account.accountId,
+                record.targetPaymentSequence);
+        BigDecimal cumulative = cumulativeReversed(account.accountId,
+                record.targetPaymentSequence);
+        int overdueDays = overdueEvaluator.maxOverdueDays(state.schedule, effectiveDate,
+                properties.getGraceDays(), properties.isExtendOverdueToBusinessDay());
+        return new ReversalOutcome(duplicate, record.idempotencyKey, record.sequence,
+                record.targetPaymentSequence, record.amount, cumulative, target.amount,
+                target.amount.subtract(cumulative), state.totalOutstanding(), account.status,
+                account.riskState, overdueDays, effectiveDate);
+    }
+
+    private BigDecimal cumulativeReversed(String accountId, long targetPaymentSequence) {
+        return repository.reversalsOf(accountId).stream()
+                .filter(r -> r.targetPaymentSequence == targetPaymentSequence)
+                .map(r -> r.amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    /**
+     * 冲正是否允许：ACTIVE/SETTLED 且未核销、未关账均可（SETTLED 允许冲正退回未结清）。
+     */
+    private boolean isFundOperationAllowed(LoanAccount account) {
+        return account.status != AccountStatus.CLOSED
+                && account.riskState != RiskState.WRITTEN_OFF;
     }
 
     /**
@@ -262,6 +426,7 @@ public class LoanServicingService {
                     a.accountId, a.status, a.riskState, a.ruleVersion, a.riskStateDate, date,
                     copies, rp, ri, rf, state.penaltyOutstanding(), state.totalOutstanding(),
                     repository.paymentsOf(a.accountId).stream().map(this::copyRecord).toList(),
+                    repository.reversalsOf(a.accountId).stream().map(this::copyReversal).toList(),
                     List.copyOf(repository.riskHistoryOf(a.accountId)));
         });
     }
@@ -276,6 +441,12 @@ public class LoanServicingService {
         repository.requireAccount(accountId);
         return repository.withAccount(accountId, a ->
                 List.copyOf(repository.riskHistoryOf(accountId)));
+    }
+
+    public List<ReversalRecord> getReversals(String accountId) {
+        repository.requireAccount(accountId);
+        return repository.withAccount(accountId, a ->
+                repository.reversalsOf(accountId).stream().map(this::copyReversal).toList());
     }
 
     // ----------------- 内部：重放 / 派生状态 -----------------
@@ -293,8 +464,9 @@ public class LoanServicingService {
     private ReplayState replay(LoanAccount account, LocalDate asOf) {
         List<Installment> schedule = account.installments;
         List<PaymentRecord> payments = repository.paymentsOf(account.accountId);
-        List<BigDecimal> outstandingPenalty = penaltyCalculator.replay(schedule, payments, asOf,
-                properties.getAnnualPenaltyRate(), properties.getDayCount(),
+        List<ReversalRecord> reversals = repository.reversalsOf(account.accountId);
+        List<BigDecimal> outstandingPenalty = penaltyCalculator.replay(schedule, payments,
+                reversals, asOf, properties.getAnnualPenaltyRate(), properties.getDayCount(),
                 properties.getGraceDays(), allocator);
 
         BigDecimal remainingScheduled = BigDecimal.ZERO;
@@ -311,8 +483,24 @@ public class LoanServicingService {
         }
         BigDecimal totalPenaltyOutstanding = outstandingPenalty.stream()
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal effectivePaidTotal = effectivePaidTotal(payments, reversals, asOf);
         return new ReplayState(schedule, remainingScheduled, totalPenaltyOutstanding,
-                grossPenalty, paidPenalty);
+                grossPenalty, paidPenalty, effectivePaidTotal);
+    }
+
+    /**
+     * 截至 asOf（含当日）的有效已收金额 = 各还款金额 − 已生效冲正金额。
+     */
+    private BigDecimal effectivePaidTotal(List<PaymentRecord> payments,
+                                          List<ReversalRecord> reversals, LocalDate asOf) {
+        BigDecimal reversed = reversals.stream()
+                .filter(r -> !r.effectiveDate.isAfter(asOf))
+                .map(r -> r.amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal gross = payments.stream()
+                .map(p -> p.amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return gross.subtract(reversed);
     }
 
     private List<AllocationLine> recordLines(String accountId, long seq) {
@@ -351,6 +539,11 @@ public class LoanServicingService {
                         .toList());
     }
 
+    private ReversalRecord copyReversal(ReversalRecord r) {
+        return new ReversalRecord(r.idempotencyKey, r.targetPaymentSequence, r.amount,
+                r.effectiveDate, r.submittedAt, r.sequence, r.reason);
+    }
+
     private LocalDate resolveEffectiveDate(LocalDate explicit, LocalDateTime submittedAt) {
         if (explicit != null) {
             if (explicit.isAfter(submittedAt.toLocalDate())) {
@@ -374,7 +567,7 @@ public class LoanServicingService {
     }
 
     /**
-     * 守恒校验：计划总额 + 应计罚息毛额 = 已收还款总额 + 剩余应还（计划未还 + 未付罚息）。
+     * 守恒校验：计划总额 + 应计罚息毛额 = 有效已收（还款-已生效冲正）+ 剩余应还（计划未还 + 未付罚息）。
      */
     private void verifyConservation(LoanAccount account, ReplayState state) {
         BigDecimal scheduledTotal = BigDecimal.ZERO;
@@ -382,11 +575,10 @@ public class LoanServicingService {
             scheduledTotal = scheduledTotal.add(i.scheduledPrincipal)
                     .add(i.scheduledInterest).add(i.scheduledFee);
         }
-        BigDecimal paidTotal = repository.paymentsOf(account.accountId).stream()
-                .map(p -> p.amount).reduce(BigDecimal.ZERO, BigDecimal::add);
 
         BigDecimal lhs = scheduledTotal.add(state.grossPenalty);
-        BigDecimal rhs = paidTotal.add(state.remainingScheduled).add(state.penaltyOutstanding);
+        BigDecimal rhs = state.effectivePaidTotal.add(state.remainingScheduled)
+                .add(state.penaltyOutstanding);
         if (lhs.compareTo(rhs) != 0) {
             throw new IllegalStateException("守恒校验失败: 计划总额+应计罚息=" + lhs
                     + " 已收+剩余=" + rhs);
@@ -411,6 +603,29 @@ public class LoanServicingService {
         if (command.amount == null || command.amount.signum() <= 0) {
             throw new ServicingException(RejectReason.PAYMENT_AMOUNT_INVALID,
                     "还款金额必须大于 0: " + command.amount);
+        }
+        if (submittedAt == null) {
+            throw new ServicingException(RejectReason.VALIDATION_ERROR, "提交时间不能为空");
+        }
+    }
+
+    private void validateReversalCommand(ReversalCommand command, LocalDateTime submittedAt) {
+        if (command == null || command.accountId == null || command.accountId.isBlank()) {
+            throw new ServicingException(RejectReason.VALIDATION_ERROR, "accountId 不能为空");
+        }
+        if (command.idempotencyKey == null || command.idempotencyKey.isBlank()) {
+            throw new ServicingException(RejectReason.VALIDATION_ERROR, "idempotencyKey 不能为空");
+        }
+        if (command.paymentSequence <= 0) {
+            throw new ServicingException(RejectReason.VALIDATION_ERROR,
+                    "被冲还款序号必须大于 0: " + command.paymentSequence);
+        }
+        if (command.amount == null || command.amount.signum() <= 0) {
+            throw new ServicingException(RejectReason.REVERSAL_AMOUNT_INVALID,
+                    "冲正金额必须大于 0: " + command.amount);
+        }
+        if (command.reason == null || command.reason.isBlank()) {
+            throw new ServicingException(RejectReason.VALIDATION_ERROR, "冲正原因不能为空");
         }
         if (submittedAt == null) {
             throw new ServicingException(RejectReason.VALIDATION_ERROR, "提交时间不能为空");
@@ -446,14 +661,16 @@ public class LoanServicingService {
         private final BigDecimal remainingScheduled;
         private final BigDecimal penaltyOutstanding;
         private final BigDecimal grossPenalty;
+        private final BigDecimal effectivePaidTotal;
 
         ReplayState(List<Installment> schedule, BigDecimal remainingScheduled,
                     BigDecimal penaltyOutstanding, BigDecimal grossPenalty,
-                    BigDecimal paidPenaltyIgnored) {
+                    BigDecimal paidPenaltyIgnored, BigDecimal effectivePaidTotal) {
             this.schedule = schedule;
             this.remainingScheduled = remainingScheduled;
             this.penaltyOutstanding = penaltyOutstanding;
             this.grossPenalty = grossPenalty;
+            this.effectivePaidTotal = effectivePaidTotal;
         }
 
         BigDecimal totalOutstanding() {

@@ -124,4 +124,52 @@ class LoanControllerTest {
                 .andExpect(jsonPath("$.reason").value(RejectReason.ACCOUNT_NOT_FOUND.name()));
         log.info("[入口] 未知账户 => 404 reason={}", RejectReason.ACCOUNT_NOT_FOUND);
     }
+
+    @Test
+    void reversalEndpointIdempotentAndTraceable() throws Exception {
+        String id = "web-rev";
+        mvc.perform(post("/api/loans/accounts/" + id)
+                        .contentType(MediaType.APPLICATION_JSON).content(openBody("EQUAL_INSTALLMENT")))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/loans/accounts/" + id + "/payments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(paymentBody("webrev-pay", "1063", "2025-02-01")))
+                .andExpect(status().isOk());
+        // 流水序号为全局递增，从账户视图取本笔还款序号
+        Integer seqValue = om.readTree(mvc.perform(get("/api/loans/accounts/" + id))
+                        .andReturn().getResponse().getContentAsString())
+                .get("payments").get(0).get("sequence").asInt();
+        long seq = seqValue.longValue();
+        String body = """
+                {"paymentSequence":%d,"idempotencyKey":"webrev-key","amount":"300",
+                 "effectiveDate":"2025-02-05","reason":"银行退回"}
+                """.formatted(seq);
+
+        mvc.perform(post("/api/loans/accounts/" + id + "/reversals")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.duplicate").value(false))
+                .andExpect(jsonPath("$.targetPaymentSequence").value((int) seq))
+                .andExpect(jsonPath("$.cumulativeReversed").value(300));
+        log.info("[入口] 首次冲正成功: 目标seq={} 累计冲正300", seq);
+
+        mvc.perform(post("/api/loans/accounts/" + id + "/reversals")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.duplicate").value(true))
+                .andExpect(jsonPath("$.cumulativeReversed").value(300));
+        log.info("[入口] 重复冲正幂等返回 duplicate=true 不重复冲账");
+
+        // 超额冲正 => 可区分错误码
+        String over = """
+                {"paymentSequence":%d,"idempotencyKey":"webrev-over","amount":"800",
+                 "effectiveDate":"2025-02-06","reason":"x"}
+                """.formatted(seq);
+        mvc.perform(post("/api/loans/accounts/" + id + "/reversals")
+                        .contentType(MediaType.APPLICATION_JSON).content(over))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value(RejectReason.REVERSAL_EXCEEDS_PAYMENT.name()));
+        log.info("[入口] 超额冲正(300+800>1063) => 422 reason={}",
+                RejectReason.REVERSAL_EXCEEDS_PAYMENT);
+    }
 }

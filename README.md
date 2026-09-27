@@ -77,6 +77,64 @@
 
 ---
 
+## 2.5 还款冲正（Payment Reversal）
+
+用于"还款记错金额/记错账户、款项被银行退回"等场景：**撤掉已入账还款的部分或全部金额，
+让账按事实重新算对**，而不是人工再补一笔反向流水。
+
+### 语义与生效日期口径
+
+- 冲正**不删除原还款**，而是新增一条不可变的**冲正事实**（冲哪笔还款 `paymentSequence`、
+  冲正金额、原因、生效日、自身序号、幂等键）；每笔冲正都可追溯。
+- 冲正金额被视作"**从未收到**"：重放时从目标还款的**有效金额**中扣减
+  （`有效金额 = 原金额 − 截至 asOf 已生效冲正合计`），
+  - **整笔冲正**：有效金额为 0，该笔还款在重放中整体跳过（不分摊、不产生本金减基数事件）；
+  - **部分冲正**：按扣减后的金额重新分摊，系统把全部剩余有效流水按生效日**整体重述重算**——
+    各期分摊、剩余应还、罚息、逾期天数、风险状态都随之重新得出。
+- **生效日期口径（关键）**：冲正有独立的 `effectiveDate`（不得早于被冲还款的生效日，
+  同样受"不得晚于提交日"与日切规则约束）。
+  - 用 `asOf < 冲正生效日` 重放（查历史视图）时，该冲正**不纳入**，历史口径与冲正前完全一致；
+  - 用 `asOf ≥ 冲正生效日` 重放时，冲正生效，账本按"这笔钱从未收到"重述：
+    被冲掉的本金重新计为未还，其在逾期期间的**罚息也会重新计出**，逾期天数重新判定。
+  - 因此冲正前的历史结论可回溯复现，冲正后的当前口径自动算对，二者都只取决于事实集合。
+- 同一笔还款的**累计冲正金额不得超过原还款金额**（否则 `REVERSAL_EXCEEDS_PAYMENT`）；
+  可以分多次部分冲正，每次都独立幂等、独立留痕。
+- **状态联动**：冲正后剩余为 0 则账户 `SETTLED`，否则 `ACTIVE`——即冲正可以让账户
+  **从已结清退回未结清**，退回后可继续正常还款；若冲正暴露出达到逾期条件的欠款，
+  逾期天数与风险分类按冲正生效日的规则版本自动重估（迁移仍受状态机白名单约束，
+  推导不出合法迁移时保持现状并告警人工处理，冲正本身不回滚）。
+
+### 冲正的幂等与冲突区分
+
+冲正复用与还款完全一致的幂等机制（同一套幂等键登记，登记项带 `kind` 区分 PAYMENT/REVERSAL）：
+
+- **同键 + 同账户 + 同目标还款 + 同金额**的重复提交：返回第一次结果
+  （`duplicate=true`，回首次冲正生效日口径），**绝不二次冲账**；
+- **同键但内容对不上**：`IDEMPOTENCY_KEY_CONFLICT`，包括金额不符、目标还款序号不符、
+  幂等键在还款与冲正之间串用；
+- **标识串到别的账户/别的还款**：目标序号在该账户不存在 → `PAYMENT_NOT_FOUND`
+  （跨账户的键另有 `IDEMPOTENCY_KEY_CONFLICT`）；
+- 金额 ≤ 0：`REVERSAL_AMOUNT_INVALID`；冲正生效日早于被冲还款：`REVERSAL_DATE_INVALID`。
+
+### 不可入账状态下的资金操作
+
+- **还款**仅允许 `status=ACTIVE` 且风险状态未核销的账户；`SETTLED`/`CLOSED`/`WRITTEN_OFF`
+  一律 `ACCOUNT_NOT_POSTABLE`。
+- **冲正**允许 `ACTIVE`/`SETTLED`（结清账户需要能被冲正退回），但 `CLOSED`（已关账）与
+  `WRITTEN_OFF`（已核销）等终态一律 `ACCOUNT_NOT_POSTABLE`，**拒绝时不写任何资金事实**。
+
+### 与分摊/计息/风险版本能力的兼容范围
+
+- 冲正完全建立在既有"计划 + 流水事实 → 重放"的模型上：分摊顺序（罚息→费用→利息→本金）、
+  罚息分段计息与非增量纯重算、逾期/宽限/工作日规则**均无需特判**，对"有效金额"自动成立。
+- 守恒恒等式升级为：
+  `计划总额 + 应计罚息毛额 = 有效已收(还款总额 − 已生效冲正) + 剩余应还`，
+  每笔冲正后同样强校验，失败抛 `IllegalStateException`。
+- 风险规则版本选取口径不变：按重估日（冲正生效日）取当时版本，规则升级不改写历史判定；
+  `NPL`/`WRITTEN_OFF` 不会因冲正被自动降级。
+
+---
+
 ## 3. 幂等与并发语义（Idempotency & Concurrency）
 
 ### 幂等
@@ -92,8 +150,11 @@
 
 - 内存账本为每个账户维护一把锁、每个幂等键维护一把锁。
 - 复合操作固定按 **"先幂等键锁、后账户锁"** 的全局唯一顺序取锁，避免死锁。
-- 同一账户的还款与风险状态变更因此被串行化：并发下不丢更新、不超额入账、余额/状态不不一致。
-- 同键并发恰好一笔真实扣款，其余命中幂等返回。
+- 同一账户的还款、冲正与风险状态变更因此被串行化：并发下不丢更新、不超额入账/超额冲正、
+  余额/罚息/状态不不一致，**同一笔钱不会被冲两次**。
+- 同键并发恰好一笔真实操作（还款扣款或冲正），其余命中幂等返回。
+- 对同一笔还款的并发部分冲正受"累计 ≤ 原金额"约束：在账户锁内判定，
+  超限者拒绝为 `REVERSAL_EXCEEDS_PAYMENT`，最终每个目标的累计冲正恒不超过其原金额。
 
 ---
 
@@ -129,6 +190,7 @@
 | ---- | ---- | ---- |
 | POST | `/api/loans/accounts/{accountId}` | 开户并生成还款计划 |
 | POST | `/api/loans/accounts/{accountId}/payments` | 还款入账（幂等） |
+| POST | `/api/loans/accounts/{accountId}/reversals` | 还款冲正（幂等：`paymentSequence/idempotencyKey/amount/effectiveDate/reason`） |
 | POST | `/api/loans/accounts/{accountId}/risk-transitions` | 手动风险迁移（白名单校验） |
 | POST | `/api/loans/accounts/{accountId}/risk-reevaluation?` | 按日期自动重估风险分类 |
 | GET  | `/api/loans/accounts/{accountId}?asOf=yyyy-MM-dd` | 账户视图（剩余本金/利息/费用/罚息、流水、风险历史） |
@@ -141,7 +203,9 @@
 
 可区分的 `reason`：`ACCOUNT_NOT_FOUND`、`ACCOUNT_NOT_POSTABLE`、
 `IDEMPOTENCY_KEY_CONFLICT`、`PAYMENT_AMOUNT_INVALID`、`OVERPAYMENT`、
-`ILLEGAL_RISK_TRANSITION`、`RULE_VERSION_UNKNOWN`、`VALIDATION_ERROR`。
+`ILLEGAL_RISK_TRANSITION`、`RULE_VERSION_UNKNOWN`、
+`REVERSAL_AMOUNT_INVALID`、`PAYMENT_NOT_FOUND`、`REVERSAL_EXCEEDS_PAYMENT`、
+`REVERSAL_DATE_INVALID`、`VALIDATION_ERROR`。
 
 ### 快速试跑（curl）
 
@@ -155,6 +219,12 @@ curl -s -X POST localhost:8080/api/loans/accounts/demo \
 curl -s -X POST localhost:8080/api/loans/accounts/demo/payments \
   -H 'Content-Type: application/json' \
   -d '{"idempotencyKey":"k1","amount":"1063","effectiveDate":"2025-02-01"}'
+
+# 对序号为 2 的还款部分冲正 200（paymentSequence 取还款响应/账户视图中的流水 sequence）
+curl -s -X POST localhost:8080/api/loans/accounts/demo/reversals \
+  -H 'Content-Type: application/json' \
+  -d '{"paymentSequence":2,"idempotencyKey":"rv1","amount":"200",
+       "effectiveDate":"2025-03-01","reason":"银行退回"}'
 
 curl -s "localhost:8080/api/loans/accounts/demo?asOf=2025-06-01"
 ```
@@ -178,11 +248,13 @@ loan.servicing.extend-overdue-to-business-day=false  # 宽限截止日落周末�
 前置：JDK 21+、Maven 3.9+（无需数据库、消息队列或任何真实凭据）。
 
 ```bash
-# 运行全部单测（40 个，覆盖正常与边界场景）
+# 运行全部单测（54 个，覆盖正常与边界场景）
 mvn clean test
 
 # 仅运行某一类
 mvn test -Dtest=PaymentServiceTest
+mvn test -Dtest=ReversalServiceTest
+mvn test -Dtest=ReversalConcurrencyTest
 mvn test -Dtest=ConcurrencyServiceTest
 mvn test -Dtest=BackdatingAndReplayTest
 
@@ -199,6 +271,8 @@ mvn spring-boot:run
 | 起息临界、ACT/360、分段计息对照逐日基准、重放不重复累计、补录重算 | `PenaltyCalculatorTest` |
 | 规则版本选取、升级不改历史、阈值、终态、迁移白名单 | `RiskRuleTest` |
 | 重复还款、键冲突、超额、非法金额、部分还款、提前结清、不可入账、分摊顺序 | `PaymentServiceTest` |
+| 整笔/部分冲正、累计冲正、结清退回、冲正回溯重述、罚息重计、幂等/串键/超额/串户/终态拒绝 | `ReversalServiceTest` |
+| 冲正并发：同一笔不被多冲、冲正与还款并发守恒、同键恰好一笔 | `ReversalConcurrencyTest` |
 | 并发：不同键不丢更新、同键恰好一笔扣款、并发不超额 | `ConcurrencyServiceTest` |
 | 回溯补录重算罚息、提交顺序不影响结果、相同输入可复现、未来日期拒绝 | `BackdatingAndReplayTest` |
 | 非法迁移、核销终态、版本升级、宽限临界、带版本历史 | `RiskServiceTest` |
@@ -213,11 +287,12 @@ mvn spring-boot:run
 ## 8. 代码结构
 
 ```
-domain/      枚举与数据载体（账户、计划期次、还款指令/流水/结果、风险流转、幂等登记、账户视图）
-engine/      ScheduleGenerator / PaymentAllocator / PenaltyCalculator /
+domain/      枚举与数据载体（账户、计划期次、还款指令/流水/结果、冲正指令/流水/结果、
+             风险流转、幂等登记(含PAYMENT/REVERSAL类型)、账户视图）
+engine/      ScheduleGenerator / PaymentAllocator / PenaltyCalculator（重放感知冲正有效金额）/
              OverdueEvaluator / RiskRuleBook / RiskRuleVersion / RiskStateMachine
-store/       LoanAccountRepository（内存账本 + 账户锁/幂等键锁）
-service/     LoanServicingService（门面：重放驱动的入账、风险、查询、守恒校验）
-web/         LoanController（HTTP 入口）/ GlobalExceptionHandler（错误码映射）
+store/       LoanAccountRepository（内存账本 + 账户锁/幂等键锁 + 还款/冲正两套流水）
+service/     LoanServicingService（门面：重放驱动的入账、冲正、风险、查询、守恒校验）
+web/         LoanController（HTTP 入口，含 /reversals）/ GlobalExceptionHandler（错误码映射）
 config/      ServicingProperties（宽限/计息/日切/罚息可配置）
 ```
