@@ -3,6 +3,7 @@ package com.github.h3yow.loanservicingenginejava.store;
 import com.github.h3yow.loanservicingenginejava.domain.IdempotencyRecord;
 import com.github.h3yow.loanservicingenginejava.domain.LoanAccount;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentRecord;
+import com.github.h3yow.loanservicingenginejava.domain.ReversalRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RiskTransitionRecord;
 import com.github.h3yow.loanservicingenginejava.domain.RejectReason;
 import com.github.h3yow.loanservicingenginejava.service.ServicingException;
@@ -17,26 +18,28 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 /**
- * 本地内存账本：账户、还款流水、风险流转历史与幂等登记表。
+ * 本地内存账本：账户、还款流水、冲正流水、风险流转历史与幂等登记表。
  *
  * <p>并发语义：每个账户一把锁、每个幂等键一把锁；复合操作始终
  * "先取键锁、再取账户锁"（单操作内唯一的锁获取顺序），避免死锁；
- * 同一账户的还款与状态变更串行化，杜绝余额/状态不一致。</p>
+ * 同一账户的还款、冲正与状态变更串行化，杜绝余额/状态不一致。</p>
  */
 @Repository
 public class LoanAccountRepository {
 
     private final Map<String, LoanAccount> accounts = new ConcurrentHashMap<>();
     private final Map<String, List<PaymentRecord>> payments = new ConcurrentHashMap<>();
+    private final Map<String, List<ReversalRecord>> reversals = new ConcurrentHashMap<>();
     private final Map<String, List<RiskTransitionRecord>> riskHistory = new ConcurrentHashMap<>();
     private final Map<String, IdempotencyRecord> idempotency = new ConcurrentHashMap<>();
     private final Map<String, Object> accountLocks = new ConcurrentHashMap<>();
     private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();
-    private long paymentSequence = 0;
+    private long ledgerSequence = 0;
 
     public void saveAccount(LoanAccount account) {
         accounts.put(account.accountId, account);
         payments.putIfAbsent(account.accountId, new ArrayList<>());
+        reversals.putIfAbsent(account.accountId, new ArrayList<>());
         riskHistory.putIfAbsent(account.accountId, new ArrayList<>());
     }
 
@@ -55,6 +58,14 @@ public class LoanAccountRepository {
 
     public List<PaymentRecord> paymentsOf(String accountId) {
         return payments.getOrDefault(accountId, List.of());
+    }
+
+    public List<ReversalRecord> reversalsOf(String accountId) {
+        return reversals.getOrDefault(accountId, List.of());
+    }
+
+    public Optional<PaymentRecord> payment(String accountId, long sequence) {
+        return paymentsOf(accountId).stream().filter(p -> p.sequence == sequence).findFirst();
     }
 
     public List<RiskTransitionRecord> riskHistoryOf(String accountId) {
@@ -92,6 +103,13 @@ public class LoanAccountRepository {
     }
 
     /**
+     * 追加冲正流水（须在账户锁内调用）。
+     */
+    public void addReversal(String accountId, ReversalRecord record) {
+        reversals.get(accountId).add(record);
+    }
+
+    /**
      * 追加风险流转记录（须在账户锁内调用）。
      */
     public void addRiskTransition(String accountId, RiskTransitionRecord record) {
@@ -109,9 +127,21 @@ public class LoanAccountRepository {
     }
 
     /**
-     * 下一流水序号（须在账户锁内调用）。
+     * 登记冲正幂等键（须在键锁内调用）。
+     */
+    public IdempotencyRecord putReversalIdempotency(String key, String accountId,
+                                                    BigDecimal amount, long reversalSeq,
+                                                    long targetPaymentSeq) {
+        IdempotencyRecord record = new IdempotencyRecord(accountId, amount, reversalSeq,
+                "REVERSAL", targetPaymentSeq);
+        idempotency.put(key, record);
+        return record;
+    }
+
+    /**
+     * 下一流水序号（还款/冲正共用同一全局序列，便于追溯排序；须在账户锁内调用）。
      */
     public long nextSequence() {
-        return ++paymentSequence;
+        return ++ledgerSequence;
     }
 }

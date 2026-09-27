@@ -21,6 +21,7 @@ public final class AccountView {
     public final BigDecimal outstandingPenalty;
     public final BigDecimal remainingTotal;
     public final List<PaymentRecord> payments;
+    public final List<ReversalRecord> reversals;
     public final List<RiskTransitionRecord> riskHistory;
 
     public AccountView(String accountId, AccountStatus status, RiskState riskState,
@@ -30,6 +31,7 @@ public final class AccountView {
                        BigDecimal remainingFee, BigDecimal outstandingPenalty,
                        BigDecimal remainingTotal,
                        List<PaymentRecord> payments,
+                       List<ReversalRecord> reversals,
                        List<RiskTransitionRecord> riskHistory) {
         this.accountId = accountId;
         this.status = status;
@@ -44,6 +46,7 @@ public final class AccountView {
         this.outstandingPenalty = outstandingPenalty;
         this.remainingTotal = remainingTotal;
         this.payments = payments;
+        this.reversals = reversals;
         this.riskHistory = riskHistory;
     }
 }
