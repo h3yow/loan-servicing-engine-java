@@ -35,6 +35,19 @@
     <build>
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!--
+                        固定类级执行顺序，避免依赖文件系统遍历顺序造成的不确定性。
+                        用例本身与顺序无关（各自独立账户/幂等键），换序验证：
+                          mvn test -Dsurefire.runOrder=alphabetical
+                          mvn test -Dsurefire.runOrder=random
+                    -->
+                    <runOrder>reversealphabetical</runOrder>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>

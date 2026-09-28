@@ -2,6 +2,7 @@ package com.github.h3yow.loanservicingenginejava.service;
 
 import com.github.h3yow.loanservicingenginejava.config.ServicingProperties;
 import com.github.h3yow.loanservicingenginejava.domain.AccountStatus;
+import com.github.h3yow.loanservicingenginejava.domain.AccountStatusEvent;
 import com.github.h3yow.loanservicingenginejava.domain.AllocationBucket;
 import com.github.h3yow.loanservicingenginejava.domain.AllocationLine;
 import com.github.h3yow.loanservicingenginejava.domain.IdempotencyRecord;
@@ -38,14 +39,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 贷款服务门面：开户、还款入账、逾期/风险重估、风险迁移与账本查询。
+ * 贷款服务门面：开户、还款入账、还款冲正、逾期/风险重估、风险迁移与账本查询。
  *
- * <p>账户派生状态（各期已还金额、罚息、余额）永远由"计划 + 还款流水"按生效日期
- * 重放得到（重放不改账本）；因此补录/回溯入账天然重新计算且可复现，
- * 重放相同输入得到相同结果。</p>
+ * <p>账户派生状态（各期已还金额、罚息、余额）永远由"计划 + 还款流水 − 已生效冲正"
+ * 按查询时点 asOf 重放得到（时点重放不落盘，落账重放以全部已登记事实的最大生效日为门控日）；
+ * 冲正只在其生效日当天（含）起生效，早于生效日的历史查询与冲正前完全一致。
+ * 补录/回溯入账天然重新计算且可复现，重放相同 (事实, asOf) 得到相同结果。</p>
  *
- * <p>守恒恒等式（任意时刻）：
- * 计划总额(本金+利息+费用) + 应计罚息毛额 = 已收还款总额 + 剩余应还（计划未还 + 未付罚息）。</p>
+ * <p>守恒恒等式（任意时点成立）：
+ * 计划总额(本金+利息+费用) + 应计罚息毛额 = 净已收(还款−已生效冲正) + 剩余应还（计划未还 + 未付罚息）。</p>
  */
 @Service
 public class LoanServicingService {
@@ -122,7 +124,7 @@ public class LoanServicingService {
                         .filter(p -> p.sequence == existing.paymentSequence)
                         .map(p -> p.effectiveDate)
                         .findFirst().orElse(effectiveDate);
-                ReplayState state = replay(account, originalDate);
+                ReplayState state = materialize(account);
                 log.info("[还款重复] key={} 命中既有流水 seq={} 生效日={} 不重复扣款; 剩余应还={} 账户状态={}",
                         command.idempotencyKey, existing.paymentSequence, originalDate,
                         state.totalOutstanding(), account.status);
@@ -131,14 +133,15 @@ public class LoanServicingService {
                         command.amount, state.totalOutstanding(), account.status);
             }
 
-            ReplayState before = replay(account, effectiveDate);
+            // 超额判定按本笔生效日时点口径（生效日更晚的冲正尚未发生，不影响当时欠款）
+            ReplayState before = replayView(account, effectiveDate);
             BigDecimal owed = before.totalOutstanding();
             if (command.amount.compareTo(owed) > 0) {
                 throw new ServicingException(RejectReason.OVERPAYMENT,
                         "还款金额 " + command.amount + " 超过剩余应还 " + owed);
             }
 
-            long seq = repository.nextSequence();
+            long seq = repository.nextSequence(account.accountId);
             // 明细留空：保存后由重放按生效日统一重新分摊（保证补录/回溯可重算）
             PaymentRecord record = new PaymentRecord(command.idempotencyKey, command.amount,
                     effectiveDate, submittedAt.toLocalDate(), seq, new ArrayList<>());
@@ -146,15 +149,16 @@ public class LoanServicingService {
             repository.putIdempotency(command.idempotencyKey, account.accountId,
                     command.amount, seq);
 
-            // 重放：重新分摊所有流水（含本笔），并把结果回写各流水
-            ReplayState after = replay(account, effectiveDate);
-            List<AllocationLine> lines = record.lines.stream()
-                    .map(l -> new AllocationLine(l.installmentSeq, l.bucket, l.amount))
-                    .toList();
+            // 落账重放：按全部已登记事实重新分摊所有流水（含本笔），并把结果回写各流水
+            ReplayState after = materialize(account);
+            List<AllocationLine> lines = recordLines(account.accountId, seq);
             verifyFullyAllocated(command.amount, lines);
-            if (after.totalOutstanding().signum() == 0) {
-                account.status = AccountStatus.SETTLED;
+            // 结清事实锚定本笔生效日时点（与历史视图口径一致），再按门控日重建当前状态
+            if (replayView(account, effectiveDate).totalOutstanding().signum() == 0) {
+                changeFundStatus(account, AccountStatus.SETTLED, effectiveDate,
+                        "PAYMENT_SETTLED(seq=" + seq + ")");
             }
+            reconcileCurrentFundStatus(account, after.gateDate);
             log.info("[还款入账] key={} seq={} 生效日={} 分摊{}条 本次分摊={} 剩余应还={} 账户状态={}",
                     command.idempotencyKey, seq, effectiveDate, lines.size(), command.amount,
                     after.totalOutstanding(), account.status);
@@ -167,8 +171,9 @@ public class LoanServicingService {
     }
 
     /**
-     * 对已入账还款发起冲正（整笔或部分）。冲正金额自原还款生效日起不再算作已收，
-     * 系统按生效日重放全部有效流水，重新得出分摊、剩余应还、罚息、逾期与风险状态。
+     * 对已入账还款发起冲正（整笔或部分）。冲正只在其生效日当天（含）起生效：
+     * 早于生效日的查询仍是冲正前口径；生效日及之后，被冲金额不再算作已收，
+     * 系统按剩余有效流水重放，重新得出分摊、剩余应还、罚息、逾期与风险状态。
      *
      * <p>重复幂等键返回既有结果（duplicate=true）；同键内容冲突、目标还款不存在、
      * 累计冲正超额、金额非法、账户处于不可入账终态均明确拒绝。</p>
@@ -200,7 +205,7 @@ public class LoanServicingService {
                         .filter(r -> r.sequence == existing.paymentSequence)
                         .findFirst().orElseThrow(() -> new IllegalStateException(
                                 "幂等登记存在但冲正流水缺失: " + command.idempotencyKey));
-                ReplayState state = replay(account, first.effectiveDate);
+                ReplayState state = materialize(account);
                 BigDecimal reversible = reversibleAmount(account, first.paymentSequence);
                 log.info("[冲正重复] key={} 命中既有冲正 seq={} 被冲还款seq={} 金额={} 不重复冲账; 剩余应还={} 状态={}/{}",
                         command.idempotencyKey, first.sequence, first.paymentSequence,
@@ -229,7 +234,7 @@ public class LoanServicingService {
                                 + target.effectiveDate);
             }
 
-            long seq = repository.nextSequence();
+            long seq = repository.nextSequence(account.accountId);
             ReversalRecord record = new ReversalRecord(command.idempotencyKey, target.sequence,
                     command.amount, effectiveDate, submittedAt.toLocalDate(), seq,
                     command.reason != null ? command.reason : "UNSPECIFIED");
@@ -237,17 +242,22 @@ public class LoanServicingService {
             repository.putReversalIdempotency(command.idempotencyKey, account.accountId,
                     command.amount, seq, target.sequence);
 
-            // 按生效日重放全部有效流水：分摊/罚息/余额全部重算
-            ReplayState after = replay(account, effectiveDate);
+            // 落账重放：全部已登记事实（含本冲正）参与，分摊/罚息/余额全部重算
+            ReplayState after = materialize(account);
+            // 冲正生效日当天的时点口径：用于状态与风险重估（与"自生效日起重述"一致）
+            ReplayState asOfState = replayView(account, effectiveDate);
 
             // 账户状态：冲正暴露欠款则由已结清退回未结清（ACTIVE），仍无欠款则保持 SETTLED
-            if (after.totalOutstanding().signum() == 0) {
-                account.status = AccountStatus.SETTLED;
+            if (asOfState.totalOutstanding().signum() == 0) {
+                changeFundStatus(account, AccountStatus.SETTLED, effectiveDate,
+                        "REVERSAL_STILL_SETTLED(seq=" + seq + ")");
             } else {
-                account.status = AccountStatus.ACTIVE;
+                changeFundStatus(account, AccountStatus.ACTIVE, effectiveDate,
+                        "REVERSAL_REOPEN(seq=" + seq + ")");
             }
             // 风险状态随冲正暴露的逾期自动重估（白名单外迁移不强行落账，留待人工/显式重估）
-            autoReclassifyAfterReversal(account, effectiveDate);
+            autoReclassifyAfterReversal(account, effectiveDate, asOfState);
+            reconcileCurrentFundStatus(account, after.gateDate);
             verifyConservation(account, after);
 
             BigDecimal reversible = target.amount.subtract(cumulative);
@@ -308,17 +318,23 @@ public class LoanServicingService {
      * 冲正后按生效日自动重估风险分类：选取当日规则版本推导分类，
      * 仅当状态机允许迁移时落账（例如 NPL 不可自动恢复），并记录风险历史。
      */
-    private void autoReclassifyAfterReversal(LoanAccount account, LocalDate asOf) {
+    private void autoReclassifyAfterReversal(LoanAccount account, LocalDate asOf, ReplayState state) {
         RiskRuleVersion rule = riskRuleBook.versionAt(asOf).orElse(null);
         if (rule == null) {
             log.info("[冲正风险] accountId={} 生效日 {} 无对应规则版本，跳过自动重估",
                     account.accountId, asOf);
             return;
         }
-        int overdueDays = overdueEvaluator.maxOverdueDays(account.installments, asOf,
+        int overdueDays = overdueEvaluator.maxOverdueDays(state.schedule, asOf,
                 properties.getGraceDays(), properties.isExtendOverdueToBusinessDay());
         RiskState target = riskRuleBook.classify(rule, overdueDays, account);
-        RiskState from = account.riskState;
+        // from 取生效日时点的风险状态（晚于 asOf 的迁移当时尚未发生）；无历史则为开户初始 NORMAL
+        RiskState from = RiskState.NORMAL;
+        for (RiskTransitionRecord h : repository.riskHistoryOf(account.accountId)) {
+            if (!h.effectiveDate.isAfter(asOf)) {
+                from = h.to;
+            }
+        }
         if (from == target) {
             log.info("[冲正风险] accountId={} 逾期天数={} 规则版本={} => 分类保持{}",
                     account.accountId, overdueDays, rule.version, target);
@@ -380,7 +396,7 @@ public class LoanServicingService {
             RiskRuleVersion rule = riskRuleBook.versionAt(date)
                     .orElseThrow(() -> new ServicingException(RejectReason.RULE_VERSION_UNKNOWN,
                             "该日期无生效规则版本: " + date));
-            ReplayState state = replay(account, date);
+            ReplayState state = replayView(account, date);
             int overdueDays = overdueEvaluator.maxOverdueDays(state.schedule, date,
                     properties.getGraceDays(), properties.isExtendOverdueToBusinessDay());
             RiskState target = riskRuleBook.classify(rule, overdueDays, account);
@@ -416,14 +432,16 @@ public class LoanServicingService {
     }
 
     /**
-     * 查询账户完整视图：按 asOf 重放，返回剩余本金/利息/费用/罚息与流水、风险历史。
+     * 查询账户完整视图：按 asOf 时点重放（生效日晚于 asOf 的冲正不参与），
+     * 返回剩余本金/利息/费用/罚息与流水、风险历史。视图中的风险状态、账户状态
+     * 同样按 asOf 时点重建：晚于 asOf 的风险迁移与结清事实在该时点尚未发生。
      */
     public com.github.h3yow.loanservicingenginejava.domain.AccountView getAccountView(
             String accountId, LocalDate asOf) {
         repository.requireAccount(accountId);
         LocalDate date = asOf != null ? asOf : LocalDate.now();
         return repository.withAccount(accountId, a -> {
-            ReplayState state = replay(a, date);
+            ReplayState state = replayView(a, date);
             List<Installment> copies = state.schedule.stream().map(Installment::copy).toList();
             BigDecimal rp = BigDecimal.ZERO;
             BigDecimal ri = BigDecimal.ZERO;
@@ -433,13 +451,55 @@ public class LoanServicingService {
                 ri = ri.add(i.scheduledInterest.subtract(i.paidInterest).max(BigDecimal.ZERO));
                 rf = rf.add(i.scheduledFee.subtract(i.paidFee).max(BigDecimal.ZERO));
             }
+            // 时点风险状态：取不晚于 asOf 的最后一条风险迁移；此前为开户初始 NORMAL/V 初始版本
+            RiskState riskAt = RiskState.NORMAL;
+            String ruleAt = a.ruleVersion;
+            LocalDate riskDateAt = a.terms.originationDate;
+            for (RiskTransitionRecord h : repository.riskHistoryOf(a.accountId)) {
+                if (!h.effectiveDate.isAfter(date)) {
+                    riskAt = h.to;
+                    ruleAt = h.ruleVersion;
+                    riskDateAt = h.effectiveDate;
+                }
+            }
+            // 时点账户状态：CLOSED 是无日期的关账终态标记，不参与历史重建；
+            // ACTIVE/SETTLED 沿资金状态事件时间线重放到 asOf（晚于 asOf 的事件尚未发生）
+            AccountStatus statusAt = AccountStatus.ACTIVE;
+            if (a.status != AccountStatus.CLOSED) {
+                for (AccountStatusEvent e : repository.statusHistoryOf(a.accountId)) {
+                    if (!e.effectiveDate.isAfter(date)) {
+                        statusAt = e.to;
+                    }
+                }
+            } else {
+                statusAt = AccountStatus.CLOSED;
+            }
             return new com.github.h3yow.loanservicingenginejava.domain.AccountView(
-                    a.accountId, a.status, a.riskState, a.ruleVersion, a.riskStateDate, date,
+                    a.accountId, statusAt, riskAt, ruleAt, riskDateAt, date,
                     copies, rp, ri, rf, state.penaltyOutstanding(), state.totalOutstanding(),
-                    repository.paymentsOf(a.accountId).stream().map(this::copyRecord).toList(),
+                    temporalPaymentCopies(a.accountId, state),
                     repository.reversalsOf(a.accountId).stream().map(ReversalRecord::copy).toList(),
                     List.copyOf(repository.riskHistoryOf(a.accountId)));
         });
+    }
+
+    /**
+     * 时点流水副本：金额仍为原始事实金额，但分摊明细取 asOf 时点净额视图的分摊
+     * （生效日晚于 asOf 的冲正尚未发生，故历史查询看到的是冲正前的原始分摊）。
+     */
+    private List<PaymentRecord> temporalPaymentCopies(String accountId, ReplayState state) {
+        List<PaymentRecord> copies = new ArrayList<>();
+        for (PaymentRecord p : repository.paymentsOf(accountId)) {
+            PaymentRecord view = state.views.get(p.sequence);
+            List<AllocationLine> lines = view != null
+                    ? view.lines.stream()
+                            .map(l -> new AllocationLine(l.installmentSeq, l.bucket, l.amount))
+                            .toList()
+                    : List.of();
+            copies.add(new PaymentRecord(p.idempotencyKey, p.amount, p.effectiveDate,
+                    p.submittedAt, p.sequence, lines));
+        }
+        return copies;
     }
 
     public List<PaymentRecord> getPayments(String accountId) {
@@ -457,26 +517,64 @@ public class LoanServicingService {
     // ----------------- 内部：重放 / 派生状态 -----------------
 
     /**
-     * 在账户真实计划与真实流水上原地重放（调用方持有账户锁，故线程安全）。
+     * 时点视图重放（不落盘）：复制计划与流水，仅纳入<b>生效日不晚于 asOf</b> 的冲正，
+     * 任何已登记但生效日更晚的冲正在该时点都"尚未发生"。
      *
-     * <p>重放输入 = 计划 + "有效还款"。有效还款金额 = 原还款金额 − 该笔累计被冲金额，
-     * 生效日仍为原还款生效日：冲正是对入账事实的更正，而非新增反向资金流水。</p>
-     *
-     * <p>重放会重新计算每笔流水的分摊明细并回写，因此：</p>
+     * <p>时间口径：</p>
      * <ul>
-     *   <li>补录/回溯入账或冲正后，历史还款分摊按生效日自动重算，结果只取决于事实；</li>
-     *   <li>各期 paid* 与 outstandingPenalty 被刷新为重放结果；</li>
-     *   <li>重放可重复调用且幂等。</li>
+     *   <li>{@code asOf < 冲正生效日}：该冲正完全不参与，视图与冲正前逐分逐厘一致；</li>
+     *   <li>{@code asOf >= 冲正生效日}（含当天）：被冲金额不再算作已收，按剩余有效流水推演。</li>
      * </ul>
+     *
+     * <p>本方法不修改账户真实计划与真实流水，可在锁内/查询路径安全重复调用，
+     * 重放相同 (事实, asOf) 必然得到相同结果。</p>
      */
-    private ReplayState replay(LoanAccount account, LocalDate asOf) {
-        List<Installment> schedule = account.installments;
+    private ReplayState replayView(LoanAccount account, LocalDate asOf) {
+        List<Installment> schedule = account.installments.stream()
+                .map(Installment::copy).collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+        return compute(account, schedule, asOf, false);
+    }
+
+    /**
+     * 落账重放：在账户真实计划上按当前全部已登记事实重放，并把分摊明细回写真实流水。
+     * 调用方必须持有账户锁。门控日取全部事实（还款/冲正）的最大生效日，
+     * 保证任何已登记事实都已生效；此后任意时点查询只会得到相同或计息更多的口径。
+     */
+    private ReplayState materialize(LoanAccount account) {
+        LocalDate gate = LocalDate.MIN;
+        for (PaymentRecord p : repository.paymentsOf(account.accountId)) {
+            if (p.effectiveDate.isAfter(gate)) {
+                gate = p.effectiveDate;
+            }
+        }
+        for (ReversalRecord r : repository.reversalsOf(account.accountId)) {
+            if (r.effectiveDate.isAfter(gate)) {
+                gate = r.effectiveDate;
+            }
+        }
+        return compute(account, account.installments, gate, true);
+    }
+
+    /**
+     * 重放核心。
+     *
+     * <p>有效还款金额 = 原还款金额 − 该笔在 asOf 时点（含）已生效的累计冲正金额，
+     * 生效日仍为原还款生效日：冲正是对入账事实在其生效日之后的更正，而非新增反向资金流水。
+     * 还款本身不做时间门控（补录还款按既有回溯口径重算历史分摊）。</p>
+     *
+     * @param persist true 时把重放产出的分摊回写真实流水（落账路径）；
+     *                false 时只写本次构造的视图副本（查询路径）。
+     */
+    private ReplayState compute(LoanAccount account, List<Installment> schedule,
+                                LocalDate asOf, boolean persist) {
         List<PaymentRecord> originals = repository.paymentsOf(account.accountId);
 
-        // 按被冲还款序号汇总累计冲正金额
+        // 仅累计生效日 <= asOf 的冲正；更晚生效的冲正在该时点尚未发生
         Map<Long, BigDecimal> reversedByPayment = new HashMap<>();
         for (ReversalRecord r : repository.reversalsOf(account.accountId)) {
-            reversedByPayment.merge(r.paymentSequence, r.amount, BigDecimal::add);
+            if (!r.effectiveDate.isAfter(asOf)) {
+                reversedByPayment.merge(r.paymentSequence, r.amount, BigDecimal::add);
+            }
         }
         // 构造有效还款视图（净额），整笔冲净的还款保留空分摊、不参与资金冲抵
         Map<Long, PaymentRecord> viewBySeq = new HashMap<>();
@@ -486,10 +584,12 @@ public class LoanServicingService {
             BigDecimal net = p.amount.subtract(reversed);
             if (net.signum() < 0) {
                 throw new IllegalStateException("冲正金额超过原还款金额（重放期发现）: seq="
-                        + p.sequence + " 原额=" + p.amount + " 累计冲正=" + reversed);
+                        + p.sequence + " 原额=" + p.amount + " 时点累计冲正=" + reversed);
             }
             if (net.signum() == 0) {
-                p.lines = new ArrayList<>();
+                if (persist) {
+                    p.lines = new ArrayList<>();
+                }
                 continue;
             }
             PaymentRecord view = new PaymentRecord(p.idempotencyKey, net, p.effectiveDate,
@@ -502,19 +602,20 @@ public class LoanServicingService {
                 properties.getAnnualPenaltyRate(), properties.getDayCount(),
                 properties.getGraceDays(), allocator);
 
-        // 将重放产出的分摊明细回写到真实流水（冲正后历史分摊随之重算）
-        for (PaymentRecord p : originals) {
-            PaymentRecord view = viewBySeq.get(p.sequence);
-            if (view != null) {
-                p.lines = view.lines.stream()
-                        .map(l -> new AllocationLine(l.installmentSeq, l.bucket, l.amount))
-                        .toList();
+        // 落账路径：把重放产出的分摊明细回写真实流水（冲正后历史分摊随之重算）
+        if (persist) {
+            for (PaymentRecord p : originals) {
+                PaymentRecord view = viewBySeq.get(p.sequence);
+                if (view != null) {
+                    p.lines = view.lines.stream()
+                            .map(l -> new AllocationLine(l.installmentSeq, l.bucket, l.amount))
+                            .toList();
+                }
             }
         }
 
         BigDecimal remainingScheduled = BigDecimal.ZERO;
         BigDecimal grossPenalty = BigDecimal.ZERO;
-        BigDecimal paidPenalty = BigDecimal.ZERO;
         for (int i = 0; i < schedule.size(); i++) {
             Installment inst = schedule.get(i);
             remainingScheduled = remainingScheduled
@@ -522,12 +623,11 @@ public class LoanServicingService {
                     .add(inst.scheduledInterest.subtract(inst.paidInterest).max(BigDecimal.ZERO))
                     .add(inst.scheduledFee.subtract(inst.paidFee).max(BigDecimal.ZERO));
             grossPenalty = grossPenalty.add(outstandingPenalty.get(i).add(inst.paidPenalty));
-            paidPenalty = paidPenalty.add(inst.paidPenalty);
         }
         BigDecimal totalPenaltyOutstanding = outstandingPenalty.stream()
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         return new ReplayState(schedule, remainingScheduled, totalPenaltyOutstanding,
-                grossPenalty, paidPenalty);
+                grossPenalty, asOf, viewBySeq);
     }
 
     private List<AllocationLine> recordLines(String accountId, long seq) {
@@ -547,8 +647,43 @@ public class LoanServicingService {
         repository.addRiskTransition(account.accountId, record);
     }
 
+    /**
+     * 资金事实驱动的 ACTIVE/SETTLED 状态迁移：仅当状态确实变化时更新当前状态
+     * 并按生效日落一条状态事件，供历史时点视图重建。调用方持有账户锁。
+     */
+    private void changeFundStatus(LoanAccount account, AccountStatus target, LocalDate effectiveDate,
+                                  String reason) {
+        if (account.status == target) {
+            return;
+        }
+        AccountStatus from = account.status;
+        account.status = target;
+        repository.addStatusEvent(account.accountId,
+                new AccountStatusEvent(effectiveDate, from, target, reason));
+        log.info("[账户状态] accountId={} {} -> {} 生效日={} 原因={}",
+                account.accountId, from, target, effectiveDate, reason);
+    }
+
+    /**
+     * 按门控日从状态事件时间线重建账户的当前 ACTIVE/SETTLED（CLOSED 不参与）。
+     * 补录/回溯操作可能让新事件的生效日早于既有事件：当前状态必须与
+     * "门控日（全部已登记事实最大生效日）时点"一致，而非简单取最后写入的目标状态。
+     */
+    private void reconcileCurrentFundStatus(LoanAccount account, LocalDate gateDate) {
+        if (account.status == AccountStatus.CLOSED) {
+            return;
+        }
+        AccountStatus current = AccountStatus.ACTIVE;
+        for (AccountStatusEvent e : repository.statusHistoryOf(account.accountId)) {
+            if (!e.effectiveDate.isAfter(gateDate)) {
+                current = e.to;
+            }
+        }
+        account.status = current;
+    }
+
     private LoanAccount snapshotAccount(LoanAccount account, LocalDate asOf) {
-        ReplayState state = replay(account, asOf);
+        ReplayState state = replayView(account, asOf);
         LoanAccount copy = new LoanAccount(account.accountId, account.terms);
         copy.installments.clear();
         state.schedule.forEach(i -> copy.installments.add(i.copy()));
@@ -679,21 +814,27 @@ public class LoanServicingService {
     }
 
     /**
-     * 重放后的派生状态视图（不可变）。
+     * 重放后的派生状态视图。
      */
     private static final class ReplayState {
         final List<Installment> schedule;
         private final BigDecimal remainingScheduled;
         private final BigDecimal penaltyOutstanding;
         private final BigDecimal grossPenalty;
+        /** 本次重放的门控日（时点视图=asOf；落账=全部事实的最大生效日）。 */
+        final LocalDate gateDate;
+        /** 各还款序号 -> 本次重放使用的净额视图（含分摊明细）。 */
+        final Map<Long, PaymentRecord> views;
 
         ReplayState(List<Installment> schedule, BigDecimal remainingScheduled,
                     BigDecimal penaltyOutstanding, BigDecimal grossPenalty,
-                    BigDecimal paidPenaltyIgnored) {
+                    LocalDate gateDate, Map<Long, PaymentRecord> views) {
             this.schedule = schedule;
             this.remainingScheduled = remainingScheduled;
             this.penaltyOutstanding = penaltyOutstanding;
             this.grossPenalty = grossPenalty;
+            this.gateDate = gateDate;
+            this.views = views;
         }
 
         BigDecimal totalOutstanding() {

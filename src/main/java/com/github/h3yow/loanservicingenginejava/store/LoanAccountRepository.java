@@ -1,5 +1,6 @@
 package com.github.h3yow.loanservicingenginejava.store;
 
+import com.github.h3yow.loanservicingenginejava.domain.AccountStatusEvent;
 import com.github.h3yow.loanservicingenginejava.domain.IdempotencyRecord;
 import com.github.h3yow.loanservicingenginejava.domain.LoanAccount;
 import com.github.h3yow.loanservicingenginejava.domain.PaymentRecord;
@@ -31,16 +32,17 @@ public class LoanAccountRepository {
     private final Map<String, List<PaymentRecord>> payments = new ConcurrentHashMap<>();
     private final Map<String, List<ReversalRecord>> reversals = new ConcurrentHashMap<>();
     private final Map<String, List<RiskTransitionRecord>> riskHistory = new ConcurrentHashMap<>();
+    private final Map<String, List<AccountStatusEvent>> statusHistory = new ConcurrentHashMap<>();
     private final Map<String, IdempotencyRecord> idempotency = new ConcurrentHashMap<>();
     private final Map<String, Object> accountLocks = new ConcurrentHashMap<>();
     private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();
-    private long ledgerSequence = 0;
 
     public void saveAccount(LoanAccount account) {
         accounts.put(account.accountId, account);
         payments.putIfAbsent(account.accountId, new ArrayList<>());
         reversals.putIfAbsent(account.accountId, new ArrayList<>());
         riskHistory.putIfAbsent(account.accountId, new ArrayList<>());
+        statusHistory.putIfAbsent(account.accountId, new ArrayList<>());
     }
 
     public LoanAccount requireAccount(String accountId) {
@@ -70,6 +72,10 @@ public class LoanAccountRepository {
 
     public List<RiskTransitionRecord> riskHistoryOf(String accountId) {
         return riskHistory.getOrDefault(accountId, List.of());
+    }
+
+    public List<AccountStatusEvent> statusHistoryOf(String accountId) {
+        return statusHistory.getOrDefault(accountId, List.of());
     }
 
     public Optional<IdempotencyRecord> idempotency(String key) {
@@ -117,6 +123,13 @@ public class LoanAccountRepository {
     }
 
     /**
+     * 追加资金驱动的账户状态事件（须在账户锁内调用）。
+     */
+    public void addStatusEvent(String accountId, AccountStatusEvent event) {
+        statusHistory.get(accountId).add(event);
+    }
+
+    /**
      * 登记幂等键（须在键锁内调用）。
      */
     public IdempotencyRecord putIdempotency(String key, String accountId,
@@ -139,9 +152,15 @@ public class LoanAccountRepository {
     }
 
     /**
-     * 下一流水序号（还款/冲正共用同一全局序列，便于追溯排序；须在账户锁内调用）。
+     * 下一流水序号（还款/冲正共用同一账户序列，便于追溯排序）。
+     *
+     * <p>序号<b>按账户独立分配</b>：某账户的第 <i>n</i> 条资金事实（还款或冲正）
+     * 序号即为 <i>n</i>。因此外部对"某账户第 1 笔还款"的引用（如
+     * {@code /payments/1/reversals}）只取决于该账户自身事实，与其它账户的活动、
+     * 用例执行顺序无关。须在账户锁内调用。</p>
      */
-    public long nextSequence() {
-        return ++ledgerSequence;
+    public long nextSequence(String accountId) {
+        return (long) payments.getOrDefault(accountId, List.of()).size()
+                + reversals.getOrDefault(accountId, List.of()).size() + 1;
     }
 }
