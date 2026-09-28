@@ -62,7 +62,8 @@ class LoanControllerTest {
 
     @Test
     void openPayQueryAndErrorCodes() throws Exception {
-        String id = "web-1";
+        // 唯一前缀：与其它接口用例共享 Spring 上下文时也不会发生账户/幂等键碰撞
+        String id = "web-1-" + System.nanoTime();
         mvc.perform(post("/api/loans/accounts/" + id)
                         .contentType(MediaType.APPLICATION_JSON).content(openBody("EQUAL_INSTALLMENT")))
                 .andExpect(status().isOk())
@@ -71,28 +72,28 @@ class LoanControllerTest {
 
         mvc.perform(post("/api/loans/accounts/" + id + "/payments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(paymentBody("wkey", "1063", "2025-02-01")))
+                        .content(paymentBody(id + "-wkey", "1063", "2025-02-01")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.duplicate").value(false));
         log.info("[入口] 首次还款成功");
 
         mvc.perform(post("/api/loans/accounts/" + id + "/payments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(paymentBody("wkey", "1063", "2025-02-01")))
+                        .content(paymentBody(id + "-wkey", "1063", "2025-02-01")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.duplicate").value(true));
         log.info("[入口] 重复还款幂等返回 duplicate=true 不重复扣款");
 
         mvc.perform(post("/api/loans/accounts/" + id + "/payments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(paymentBody("wkey", "999", "2025-02-01")))
+                        .content(paymentBody(id + "-wkey", "999", "2025-02-01")))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason").value(RejectReason.IDEMPOTENCY_KEY_CONFLICT.name()));
         log.info("[入口] 同键不同金额 => 422 reason={}", RejectReason.IDEMPOTENCY_KEY_CONFLICT);
 
         mvc.perform(post("/api/loans/accounts/" + id + "/payments")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(paymentBody("over", "9999999", "2025-02-01")))
+                        .content(paymentBody(id + "-over", "9999999", "2025-02-01")))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason").value(RejectReason.OVERPAYMENT.name()));
         log.info("[入口] 超额 => 422 reason={}", RejectReason.OVERPAYMENT);

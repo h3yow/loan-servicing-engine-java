@@ -25,7 +25,8 @@ import java.util.List;
  *   <li>本金随还款日变动：还款日当天冲抵的是截至当日（含当日）已计罚息，
  *       故当日还本不缩减当日基数，按还款日将起息区间切段逐段计息；</li>
  *   <li>同日多笔还款按序号串行：后一笔的待付罚息须扣除同日早序号还款已付罚息；</li>
- *   <li>每次都从计划与历史流水重放重算（非增量累加），补录/回溯入账后结论一致且不重复累计。</li>
+ *   <li>每次都在计划副本上从计划与"截至 asOf 已生效的净流水"重放重算（纯函数、非增量累加），
+ *       补录/回溯、冲正时间点重述后结论一致且不重复累计，真实账本与流水不被修改。</li>
  * </ul>
  */
 @Component
@@ -77,32 +78,58 @@ public class PenaltyCalculator {
     }
 
     /**
-     * 重放全部还款：按生效日（同日按序号）逐笔刷新罚息并重新分摊，
-     * 重新分摊得到的明细回写到各流水（补录/回溯后历史分摊随之重算）。
-     * 最终把截至 asOf 的应计未付罚息写入 outstandingPenalty，
-     * 已付罚息/本金/利息/费用写入对应 paid* 字段，并返回截至 asOf 各期应计未付罚息。
+     * 时间点重放（纯函数）：只纳入生效日 ≤ asOf 的有效还款，在计划副本上按生效日
+     * （同日按序号）逐笔刷新罚息并重新分摊。不修改任何真实流水，也不修改入参计划。
+     *
+     * <p>注意：调用方必须先按"查询时点"过滤冲正（生效日晚于 asOf 的冲正不生效），
+     * 再把净有效还款视图传入；{@code payments} 本身的生效日同样按 asOf 过滤，
+     * 因此"按历史日期查询"得到的就是当时真实口径。</p>
+     *
+     * @return 重放结果（各期副本，含 paid* 与截至 asOf 的 outstandingPenalty；
+     *         以及每笔有效还款在该时点重算得到的分摊明细，按流水序号索引）。
      */
-    public List<BigDecimal> replay(List<Installment> schedule,
-                                   List<PaymentRecord> payments,
-                                   LocalDate asOf,
-                                   BigDecimal annualPenaltyRate,
-                                   DayCountConvention convention,
-                                   int graceDays,
-                                   PaymentAllocator allocator) {
-        resetPaid(schedule);
+    public ReplayResult replayAt(List<Installment> schedule,
+                                 List<PaymentRecord> payments,
+                                 LocalDate asOf,
+                                 BigDecimal annualPenaltyRate,
+                                 DayCountConvention convention,
+                                 int graceDays,
+                                 PaymentAllocator allocator) {
+        List<Installment> work = schedule.stream().map(Installment::copy).toList();
+        resetPaid(work);
         List<PaymentRecord> ordered = payments.stream()
+                .filter(p -> !p.effectiveDate.isAfter(asOf))
                 .sorted(Comparator.comparing((PaymentRecord p) -> p.effectiveDate)
                         .thenComparingLong(p -> p.sequence))
                 .toList();
+        java.util.Map<Long, List<AllocationLine>> linesBySeq = new java.util.HashMap<>();
         for (PaymentRecord payment : ordered) {
             // 刷新截至本笔生效日（含当日，且不包含本笔自身）的罚息
-            refreshPenalty(schedule, ordered, payment.effectiveDate, payment.sequence,
+            refreshPenalty(work, ordered, payment.effectiveDate, payment.sequence,
                     annualPenaltyRate, convention, graceDays, true);
-            // allocate 既冲抵 paid* 又产出明细；回写流水（补录/回溯后历史分摊随之重算）。
-            payment.lines = allocator.allocate(schedule, payment.amount, payment.effectiveDate);
+            // allocate 既冲抵 paid* 又产出明细（明细随结果返回，不回写真实流水）
+            List<AllocationLine> lines = allocator.allocate(work, payment.amount, payment.effectiveDate);
+            linesBySeq.put(payment.sequence, lines);
         }
-        return refreshPenalty(schedule, ordered, asOf, Long.MAX_VALUE,
+        List<BigDecimal> outstanding = refreshPenalty(work, ordered, asOf, Long.MAX_VALUE,
                 annualPenaltyRate, convention, graceDays, false);
+        return new ReplayResult(work, outstanding, linesBySeq);
+    }
+
+    /**
+     * 时间点重放结果：各期派生口径副本 + 每笔有效还款的重算分摊（按流水序号索引）。
+     */
+    public static final class ReplayResult {
+        public final List<Installment> installments;
+        public final List<BigDecimal> outstandingPenalty;
+        public final java.util.Map<Long, List<AllocationLine>> linesBySequence;
+
+        public ReplayResult(List<Installment> installments, List<BigDecimal> outstandingPenalty,
+                            java.util.Map<Long, List<AllocationLine>> linesBySequence) {
+            this.installments = installments;
+            this.outstandingPenalty = outstandingPenalty;
+            this.linesBySequence = linesBySequence;
+        }
     }
 
     /**
